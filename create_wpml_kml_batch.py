@@ -1,19 +1,30 @@
-# generate_cco_from_polygon.py  (cover, preview, split, KMZ, standalone GUI)
-# 功能：读取包含 <Polygon> 的 KML，生成覆盖式 CCO 航线（template.kml + waylines.wpml + 可选 KMZ）
-# 典型用法（命令行覆盖式）：
-#   python create_wpml_kml_batch.py \
-#     --polygon ./2025sj.kml \
+"""
+CCO flight planner: cover-style circular waylines for DJI drones.
+
+Reads a KML file with one <Polygon>, lays a grid of equal-radius circles
+over it, samples waypoints on each circle with the camera pointing at the
+circle centre, and writes DJI WPML files (template.kml + waylines.wpml),
+optionally packed as KMZ and split into sub-missions.
+
+Usage (command line):
+    python create_wpml_kml_batch.py \
+      --polygon ./field.kml \
 #     --drone_enum 99 --drone_sub 1 \
 #     --payload_enum 89 --payload_sub 0 --payload_pos 0 \
 #     --circle_radius 5 --circle_overlap 0.3 --per_ring 18 \
 #     --alt 5 --gimbal -45 --speed 6 \
 #     --out_dir ./output --max_points 300 \
 #     --grid_bearing 0 --clip_inside 1 \
-#     --preview_gui 0
-#
-# 直接双击/无参数运行：进入 Standalone GUI 流程（选择 KML 与输出目录、滑块实时预览、Apply & Generate 后落盘）
+      --preview_gui 0
 
-import os, math, argparse, xml.etree.ElementTree as ET, zipfile, shutil, sys
+Run without arguments to pick the KML and output folder in dialogs and tune
+the layout with sliders before writing anything.
+
+Author: Liangchao Deng (邓良超)
+License: MIT
+"""
+
+import os, math, argparse, xml.etree.ElementTree as ET, zipfile, sys
 # Backend selection: prefer TkAgg if Tk>=8.6; else try QtAgg (PyQt5/PySide6); else fall back to Agg
 TK_OK = False
 USE_QT = False
@@ -122,9 +133,7 @@ def pick_select_folder():
             return ""
     return ""
 
-from copy import deepcopy
-
-# ------------------ 命名空间 ------------------
+# ------------------ XML namespaces ------------------
 NS = {
     "kml":  "http://www.opengis.net/kml/2.2",
     "wpml": "http://www.dji.com/wpmz/1.0.4",
@@ -133,7 +142,7 @@ NS = {
 for prefix, uri in NS.items():
     ET.register_namespace(prefix if prefix != "kml" else "", uri)
 
-# ------------------ 设备信息（飞机/载荷）写入 ------------------
+# ------------------ Aircraft / payload tags ------------------
 def add_device_info_to_doc(doc, device):
     if not device:
         return
@@ -160,28 +169,34 @@ def add_device_info_to_doc(doc, device):
     except Exception:
         pass
 
-# ------------------ 基本几何 ------------------
-def meters_to_deg(lat_deg, dx_m, dy_m):
-    """米->经纬度偏移（近似，够用）：dx 向东(+)、dy 向北(+)"""
+# ------------------ Planar geometry (small-area approximation) ------------------
+def _m_scale(lat_deg):
+    """Metres per degree of longitude and latitude at a given latitude."""
     lat_rad = math.radians(lat_deg)
     m_per_deg_lat = 111132.92 - 559.82*math.cos(2*lat_rad) + 1.175*math.cos(4*lat_rad)
     m_per_deg_lon = 111412.84*math.cos(lat_rad) - 93.5*math.cos(3*lat_rad)
+    return m_per_deg_lon, m_per_deg_lat
+
+
+def meters_to_deg(lat_deg, dx_m, dy_m):
+    """Metre offsets to degree offsets; dx positive east, dy positive north."""
+    m_per_deg_lon, m_per_deg_lat = _m_scale(lat_deg)
     dlat = dy_m / m_per_deg_lat
     dlon = dx_m / m_per_deg_lon
     return dlon, dlat
 
 def bearing_to_vector(bearing_deg, dist_m):
-    """方位角(0=北,顺时针) + 距离 -> 平面位移(dx,dy)"""
+    """Bearing (0 = north, clockwise) and distance to an (east, north) offset."""
     b = math.radians(bearing_deg)
-    dx = dist_m * math.sin(b)  # 东
-    dy = dist_m * math.cos(b)  # 北
+    dx = dist_m * math.sin(b)  # east
+    dy = dist_m * math.cos(b)  # north
     return dx, dy
 
 def normalize_heading(deg):
     x = deg % 360.0
     return x if x >= 0 else x+360
 
-# 旋转与点在多边形内判断
+# Rotation and point-in-polygon test
 def rotate_xy(x, y, deg):
     a = math.radians(deg)
     ca, sa = math.cos(a), math.sin(a)
@@ -216,23 +231,25 @@ def circle_touches_polygon(center_lon, center_lat, radius_m, per_circle, start_b
             return True
     return False
 
-# ------------------ 多边形解析 ------------------
+# ------------------ Polygon parsing ------------------
 def parse_polygon_kml(path):
-    """返回 [(lon,lat), ...] 外环坐标（假设单 Polygon）"""
-    tree = ET.parse(path)
-    root = tree.getroot()
-    doc = root.find("kml:Document", NS) or root
+    """Outer ring of the first Polygon in a KML file as [(lon, lat), ...].
+
+    Works with and without the KML 2.2 namespace (some GIS exports omit it).
+    """
+    root = ET.parse(path).getroot()
     coords_text = None
-    for placemark in doc.findall(".//kml:Placemark", NS):
-        poly = placemark.find(".//kml:Polygon", NS)
-        if poly is None:
-            continue
-        ring = poly.find(".//kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", NS)
-        if ring is not None and ring.text and ring.text.strip():
-            coords_text = ring.text
+    for prefix in ("kml:", ""):
+        ns = NS if prefix else None
+        for poly in root.iter(f"{{{NS['kml']}}}Polygon" if prefix else "Polygon"):
+            ring = poly.find(f".//{prefix}outerBoundaryIs/{prefix}LinearRing/{prefix}coordinates", ns)
+            if ring is not None and ring.text and ring.text.strip():
+                coords_text = ring.text
+                break
+        if coords_text:
             break
     if not coords_text:
-        raise ValueError("未在 KML 中找到 Polygon 坐标。")
+        raise ValueError(f"No Polygon coordinates found in {path}.")
 
     pts = []
     for line in coords_text.strip().split():
@@ -243,15 +260,13 @@ def parse_polygon_kml(path):
     if len(pts) > 2 and pts[0] == pts[-1]:
         pts = pts[:-1]
     if len(pts) < 3:
-        raise ValueError("Polygon 顶点不足（<3）。")
+        raise ValueError("Polygon has fewer than 3 vertices.")
     return pts
 
 def polygon_centroid(lon_lat_pts):
-    """多边形质心（经纬度）——用平面近似（对小地块足够）"""
+    """Area centroid of the polygon (planar approximation, fine for field plots)."""
     lon0, lat0 = lon_lat_pts[0]
-    lat_rad = math.radians(lat0)
-    m_per_deg_lat = 111132.92 - 559.82*math.cos(2*lat_rad) + 1.175*math.cos(4*lat_rad)
-    m_per_deg_lon = 111412.84*math.cos(lat_rad) - 93.5*math.cos(3*lat_rad)
+    m_per_deg_lon, m_per_deg_lat = _m_scale(lat0)
 
     xy = []
     for lon, lat in lon_lat_pts:
@@ -276,18 +291,12 @@ def polygon_centroid(lon_lat_pts):
     lat_c = lat0 + Cy / m_per_deg_lat
     return lon_c, lat_c
 
-# ------------------ 环间顺序平滑 & 分片（保留距离计算与分片） ------------------
-def _m_per_deg(lat_deg):
-    lat_rad = math.radians(lat_deg)
-    m_per_deg_lat = 111132.92 - 559.82*math.cos(2*lat_rad) + 1.175*math.cos(4*lat_rad)
-    m_per_deg_lon = 111412.84*math.cos(lat_rad) - 93.5*math.cos(3*lat_rad)
-    return m_per_deg_lon, m_per_deg_lat
-
+# ------------------ Distances and slicing ------------------
 def _dist_m(p1, p2):
-    """两经纬点近似距离（m）"""
-    lon1, lat1, _ = p1
-    lon2, lat2, _ = p2
-    m_per_deg_lon, m_per_deg_lat = _m_per_deg((lat1+lat2)/2.0)
+    """Approximate distance in metres between two (lon, lat, ...) points."""
+    lon1, lat1 = p1[0], p1[1]
+    lon2, lat2 = p2[0], p2[1]
+    m_per_deg_lon, m_per_deg_lat = _m_scale((lat1+lat2)/2.0)
     dx = (lon2 - lon1) * m_per_deg_lon
     dy = (lat2 - lat1) * m_per_deg_lat
     return (dx*dx + dy*dy) ** 0.5
@@ -299,34 +308,18 @@ def chunk_slices(total, max_points):
     return cuts
 
 def build_kmz_for_part(out_dir, part_tag, template_src, waylines_src):
-    build_root = os.path.join(out_dir, f"{part_tag}_build")
-    wpmz_dir = os.path.join(build_root, "wpmz")
-    res_dir = os.path.join(wpmz_dir, "res")
-    os.makedirs(res_dir, exist_ok=True)
-    shutil.copyfile(template_src, os.path.join(wpmz_dir, "template.kml"))
-    shutil.copyfile(waylines_src, os.path.join(wpmz_dir, "waylines.wpml"))
-    kmz_path = os.path.join(out_dir, f"{part_tag}.kmz")
-    with zipfile.ZipFile(kmz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("wpmz/", "")
-        zf.writestr("wpmz/res/", "")
-        zf.write(os.path.join(wpmz_dir, "template.kml"), arcname="wpmz/template.kml")
-        zf.write(os.path.join(wpmz_dir, "waylines.wpml"), arcname="wpmz/waylines.wpml")
-    shutil.rmtree(build_root, ignore_errors=True)
-    print(f"[KMZ] -> {kmz_path}")
+    """Pack one sub-mission as <out_dir>/<part_tag>.kmz."""
+    write_kmz(os.path.join(out_dir, f"{part_tag}.kmz"), template_src, waylines_src)
 
-# ------------------ 覆盖式 CCO：等半径圆阵 ------------------
+# ------------------ Cover-style CCO: grid of equal circles ------------------
 def _bbox_lonlat(poly):
     lons = [p[0] for p in poly]; lats = [p[1] for p in poly]
     return (min(lons), min(lats), max(lons), max(lats))
 
-def _m_scale(lat_deg):
-    lat_rad = math.radians(lat_deg)
-    m_per_deg_lat = 111132.92 - 559.82*math.cos(2*lat_rad) + 1.175*math.cos(4*lat_rad)
-    m_per_deg_lon = 111412.84*math.cos(lat_rad) - 93.5*math.cos(3*lat_rad)
-    return m_per_deg_lon, m_per_deg_lat
-
 def grid_circle_centers(poly, center_lon, center_lat, step_m, padding_m, bearing_deg=0.0):
-    """在多边形外接框(外扩 padding)内，生成步距为 step_m 的圆心网格（蛇形路径顺序）。返回[(lon,lat), ...]"""
+    """Circle centres on a square grid of spacing ``step_m`` covering the
+    polygon bounding box grown by ``padding_m``, rotated by ``bearing_deg``
+    and returned in serpentine (boustrophedon) order as [(lon, lat), ...]."""
     xmin, ymin, xmax, ymax = _bbox_lonlat(poly)
     m_per_deg_lon, m_per_deg_lat = _m_scale(center_lat)
     dx = padding_m / m_per_deg_lon
@@ -371,11 +364,15 @@ def prune_centers_outside(poly, centers_lonlat, circle_radius_m, per_circle, sta
     return kept
 
 def generate_cover_cco_points(centers_lonlat, per_circle, circle_radius_m, start_bearing_deg=0.0, clip_poly=None):
-    """
-    对每个圆心生成一圈相同半径的点（per_circle 个），并蛇形拼接：
-    - 起始角 = start_bearing_deg
-    - 相邻圆之间，为减少跨圆跳距：自动旋转该圆的起点角到距离上一圆最后一个点最近的位置；并交替正/反向
-    返回 [(lon,lat,heading), ...]
+    """Sample ``per_circle`` waypoints on every circle and chain the circles.
+
+    * The first point of each circle is at ``start_bearing_deg``.
+    * To shorten transits, each circle is rotated so that it starts at the
+      point nearest to the last waypoint of the previous circle, and the
+      direction alternates between clockwise and counter-clockwise.
+    * With ``clip_poly`` only waypoints inside the polygon are kept.
+
+    Returns [(lon, lat, heading_deg), ...]; heading points at the circle centre.
     """
     if not centers_lonlat:
         return []
@@ -390,7 +387,7 @@ def generate_cover_cco_points(centers_lonlat, per_circle, circle_radius_m, start
             dx, dy = bearing_to_vector(ang, circle_radius_m)
             dlon, dlat = meters_to_deg(lat_c, dx, dy)
             lat = lat_c + dlat; lon = lon_c + dlon
-            head = normalize_heading(math.degrees(math.atan2(-dx, -dy)))  # 机头指向圆心
+            head = normalize_heading(math.degrees(math.atan2(-dx, -dy)))  # nose towards the centre
             if (clip_poly is None) or point_in_polygon(lon, lat, clip_poly):
                 pts_circle.append((lon, lat, head))
         seq = list(reversed(pts_circle)) if reverse_dir else pts_circle
@@ -408,7 +405,7 @@ def generate_cover_cco_points(centers_lonlat, per_circle, circle_radius_m, start
         reverse_dir = not reverse_dir
     return all_points
 
-# ------------------ WPML/KML 构建 ------------------
+# ------------------ WPML / KML writers ------------------
 def el(tag, text=None, ns="wpml", attrib=None):
     e = ET.Element(f"{{{NS[ns]}}}{tag}", attrib or {})
     if text is not None:
@@ -440,7 +437,9 @@ def make_mission_config(alt_m, speed_mps):
     mc.append(el("globalTransitionalSpeed", speed_mps))
     return mc
 
-def add_wp(folder, idx, lon, lat, alt_m, speed_mps, heading_deg, gimbal_pitch_deg, with_action=True, file_suffix="LiangchaoDeng_SHZU"):
+def add_wp(folder, idx, lon, lat, alt_m, speed_mps, heading_deg, gimbal_pitch_deg, with_action=True,
+           file_suffix="LiangchaoDeng_SHZU", payload_pos=0):
+    """Append one waypoint Placemark with a take-photo action on arrival."""
     pm = ET.SubElement(folder, f"{{{NS['kml']}}}Placemark")
     pt = ET.SubElement(pm, f"{{{NS['kml']}}}Point")
     coord = ET.SubElement(pt, f"{{{NS['kml']}}}coordinates")
@@ -475,20 +474,25 @@ def add_wp(folder, idx, lon, lat, alt_m, speed_mps, heading_deg, gimbal_pitch_de
         act.append(el("actionId",0))
         act.append(el("actionActuatorFunc","takePhoto"))
         ap = el("actionActuatorFuncParam")
-        ap.append(el("payloadPositionIndex",0))
+        ap.append(el("payloadPositionIndex", int(payload_pos or 0)))
         ap.append(el("fileSuffix", file_suffix))
         act.append(ap)
         ag.append(act)
         pm.append(ag)
     return pm
 
-def write_template_kml(path, points, alt_m, speed_mps, gimbal_pitch, device=None):
+def _payload_pos(device):
+    return (device or {}).get("payload_pos") or 0
+
+
+def write_template_kml(path, points, alt_m, speed_mps, gimbal_pitch, file_suffix="LiangchaoDeng_SHZU", device=None):
     kml, doc = new_kml_doc()
     add_device_info_to_doc(doc, device)
     doc.append(make_mission_config(alt_m, speed_mps))
     folder = new_folder("CCO-Template")
     for i,(lon,lat,head) in enumerate(points):
-        add_wp(folder, i, lon, lat, alt_m, speed_mps, head, gimbal_pitch, with_action=True)
+        add_wp(folder, i, lon, lat, alt_m, speed_mps, head, gimbal_pitch, with_action=True,
+               file_suffix=file_suffix, payload_pos=_payload_pos(device))
     doc.append(folder)
     ET.ElementTree(kml).write(path, encoding="utf-8", xml_declaration=True)
     print(f"[OK] template.kml -> {path}")
@@ -499,36 +503,32 @@ def write_waylines_wpml(path, points, alt_m, speed_mps, gimbal_pitch, file_suffi
     doc.append(make_mission_config(alt_m, speed_mps))
     folder = new_folder("CCO-Waylines")
     for i,(lon,lat,head) in enumerate(points):
-        add_wp(folder, i, lon, lat, alt_m, speed_mps, head, gimbal_pitch, with_action=True, file_suffix=file_suffix)
+        add_wp(folder, i, lon, lat, alt_m, speed_mps, head, gimbal_pitch, with_action=True,
+               file_suffix=file_suffix, payload_pos=_payload_pos(device))
     doc.append(folder)
     ET.ElementTree(kml).write(path, encoding="utf-8", xml_declaration=True)
     print(f"[OK] waylines.wpml -> {path}")
 
 def write_kmz(kmz_path, template_path, waylines_path):
-    build_root = os.path.join(os.path.dirname(kmz_path), "_cco_build")
-    wpmz_dir = os.path.join(build_root, "wpmz")
-    res_dir  = os.path.join(wpmz_dir, "res")
-    os.makedirs(res_dir, exist_ok=True)
-    shutil.copyfile(template_path, os.path.join(wpmz_dir, "template.kml"))
-    shutil.copyfile(waylines_path, os.path.join(wpmz_dir, "waylines.wpml"))
+    """Pack template.kml and waylines.wpml in the WPMZ layout DJI Pilot 2 imports:
+    wpmz/template.kml, wpmz/waylines.wpml and an empty wpmz/res/."""
     with zipfile.ZipFile(kmz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("wpmz/", "")
         zf.writestr("wpmz/res/", "")
-        zf.write(os.path.join(wpmz_dir, "template.kml"), arcname="wpmz/template.kml")
-        zf.write(os.path.join(wpmz_dir, "waylines.wpml"), arcname="wpmz/waylines.wpml")
-    shutil.rmtree(build_root, ignore_errors=True)
+        zf.write(template_path, arcname="wpmz/template.kml")
+        zf.write(waylines_path, arcname="wpmz/waylines.wpml")
     print(f"[OK] KMZ -> {kmz_path}")
 
 def write_slice_files(out_dir, base_tag, idx1, points, alt_m, speed_mps, gimbal_pitch, file_suffix, device=None):
     os.makedirs(out_dir, exist_ok=True)
     t_path = os.path.join(out_dir, f"{base_tag}_part{idx1:02d}.kml")
     w_path = os.path.join(out_dir, f"{base_tag}_part{idx1:02d}.wpml")
-    write_template_kml(t_path, points, alt_m, speed_mps, gimbal_pitch, device=device)
+    write_template_kml(t_path, points, alt_m, speed_mps, gimbal_pitch, file_suffix=file_suffix, device=device)
     write_waylines_wpml(w_path, points, alt_m, speed_mps, gimbal_pitch, file_suffix=file_suffix, device=device)
     return t_path, w_path
 
-# ------------------ 预览绘图 ------------------
-def show_preview(polygon_lonlat, points_lonlat_head, center_lon, center_lat, title="CCO Preview"):
+# ------------------ Previews ------------------
+def show_preview(polygon_lonlat, points_lonlat_head, center_lon, center_lat, title="CCO Preview", centers=None):
     if plt is None:
         print("[PREVIEW] matplotlib not installed. Run `pip install matplotlib`. Skipping preview.")
         return
@@ -543,20 +543,15 @@ def show_preview(polygon_lonlat, points_lonlat_head, center_lon, center_lat, tit
     plt.plot(poly_x, poly_y, linestyle='--', linewidth=1)
     plt.plot(xs, ys, linewidth=1)
     plt.scatter(xs, ys, s=8)
-    try:
-        centers = globals().get("__preview_centers", None)
-        if centers:
-            cx = [c[0] for c in centers]; cy = [c[1] for c in centers]
-            plt.scatter(cx, cy, s=10, alpha=0.5)
-    except Exception:
-        pass
+    if centers:
+        plt.scatter([c[0] for c in centers], [c[1] for c in centers], s=10, alpha=0.5)
     plt.scatter([center_lon], [center_lat], marker='x')
     plt.annotate("start", (xs[0], ys[0]))
     plt.annotate("end", (xs[-1], ys[-1]))
     plt.title(title); plt.xlabel("Longitude"); plt.ylabel("Latitude")
     plt.axis('equal'); plt.tight_layout(); plt.show()
 
-# ------------------ 保存静态 PNG 预览（无窗口） ------------------
+
 def save_preview_png(polygon_lonlat, points_lonlat_head, centers_lonlat, center_lon, center_lat, out_png):
     if plt is None:
         print(f"[PREVIEW] matplotlib not installed. Cannot save preview: {out_png}")
@@ -585,7 +580,7 @@ def save_preview_png(polygon_lonlat, points_lonlat_head, centers_lonlat, center_
     plt.close(fig)
     print(f"[PREVIEW] saved PNG -> {out_png}")
 
-# ------------------ 交互式 GUI 预览 ------------------
+# ------------------ Interactive preview ------------------
 def show_preview_gui(poly, center_lon, center_lat, init_params):
     if plt is None or Slider is None or Button is None:
         print("[PREVIEW GUI] GUI backend not available. Install Tk>=8.6 or PyQt5/PySide6 + matplotlib.")
@@ -604,9 +599,9 @@ def show_preview_gui(poly, center_lon, center_lat, init_params):
     # mutable state for polygon and center (allow replacing via file picker)
     poly_ref = {"poly": poly, "lon_c": center_lon, "lat_c": center_lat}
 
-    fig, ax = plt.subplots(figsize=(11, 7))
+    fig, ax = plt.subplots(figsize=(11, 7.5))
     # Leave space on the right for a wider controls panel
-    plt.subplots_adjust(left=0.08, right=0.70, top=0.96, bottom=0.08)
+    plt.subplots_adjust(left=0.08, right=0.62, top=0.96, bottom=0.08)
     # polygon
     poly_x = [p[0] for p in poly_ref["poly"]] + [poly_ref["poly"][0][0]]
     poly_y = [p[1] for p in poly_ref["poly"]] + [poly_ref["poly"][0][1]]
@@ -621,7 +616,7 @@ def show_preview_gui(poly, center_lon, center_lat, init_params):
 
     axcolor = 'lightgoldenrodyellow'
     # Right-side control panel positions (wider panel to prevent label overflow)
-    _px, _pw = 0.71, 0.27
+    _px, _pw = 0.76, 0.22
     # Sliders (top to bottom)
     ax_max  = plt.axes([_px, 0.90, _pw, 0.035], facecolor=axcolor)
     ax_r    = plt.axes([_px, 0.86, _pw, 0.03],  facecolor=axcolor)
@@ -638,7 +633,7 @@ def show_preview_gui(poly, center_lon, center_lat, init_params):
     s_pad = Slider(ax_pad, 'Padding',     0.0, 100.0,   valinit=cover_padding, valstep=1.0)
     s_bear= Slider(ax_bear,'Bearing (°)', -180.0, 180.0,valinit=grid_bearing,  valstep=1.0)
     s_max = Slider(ax_max, 'Max points',  50,  2000,    valinit=float(max_points_gui), valstep=1)
-    s_max.on_changed(lambda v: None)  # 不触发重算，只在 Apply 时生效
+    s_max.on_changed(lambda v: None)  # only read on Apply, no redraw needed
 
     # ---- Keyboard control for sliders ----
     sliders = [
@@ -723,10 +718,11 @@ def show_preview_gui(poly, center_lon, center_lat, init_params):
     fig.canvas.mpl_connect('key_press_event', on_key)
 
     # Buttons on right panel
-    ax_clip  = plt.axes([_px, 0.33, 0.12, 0.05]); btn_clip  = Button(ax_clip,  f"Clip: {'ON' if clip_inside else 'OFF'}")
-    ax_prune = plt.axes([_px + 0.14, 0.33, 0.12, 0.05]); btn_prune = Button(ax_prune, f"Prune: {'ON' if prune_outside else 'OFF'}")
+    ax_clip  = plt.axes([_px, 0.33, 0.10, 0.05]); btn_clip  = Button(ax_clip,  f"Clip: {'ON' if clip_inside else 'OFF'}")
+    ax_prune = plt.axes([_px + 0.12, 0.33, 0.10, 0.05]); btn_prune = Button(ax_prune, f"Prune: {'ON' if prune_outside else 'OFF'}")
     ax_open  = plt.axes([_px, 0.26, _pw, 0.05]); btn_open  = Button(ax_open,  "Open KML…")
     ax_apply = plt.axes([_px, 0.18, _pw, 0.06]); btn_apply = Button(ax_apply, "Apply & Generate")
+    init_params["applied"] = False
 
     # Prefill device defaults if not provided
     def _def(v, dv):
@@ -742,6 +738,10 @@ def show_preview_gui(poly, center_lon, center_lat, init_params):
     ax_pe  = plt.axes([_px, 0.50, _pw, 0.045]); tb_pe  = TextBox(ax_pe,  "PayloadEnum", initial=init_pe)
     ax_pse = plt.axes([_px, 0.45, _pw, 0.045]); tb_pse = TextBox(ax_pse, "PayloadSub",  initial=init_pse)
     ax_pp  = plt.axes([_px, 0.40, _pw, 0.045]); tb_pp  = TextBox(ax_pp,  "PayloadPos",  initial=init_pp)
+    # Flight settings (below the Apply button)
+    ax_alt = plt.axes([_px, 0.115, _pw, 0.04]); tb_alt = TextBox(ax_alt, "Alt (m)",     initial=str(init_params.get("alt", 50.0)))
+    ax_spd = plt.axes([_px, 0.065, _pw, 0.04]); tb_spd = TextBox(ax_spd, "Speed (m/s)", initial=str(init_params.get("speed", 6.0)))
+    ax_gim = plt.axes([_px, 0.015, _pw, 0.04]); tb_gim = TextBox(ax_gim, "Gimbal (°)",  initial=str(init_params.get("gimbal", -45.0)))
 
     def recalc_and_draw(_=None):
         R = s_r.val
@@ -804,6 +804,16 @@ def show_preview_gui(poly, center_lon, center_lat, init_params):
         init_params["payload_enum"] = _to_int_or_none(tb_pe.text)
         init_params["payload_sub"] = _to_int_or_none(tb_pse.text)
         init_params["payload_pos"] = _to_int_or_none(tb_pp.text)
+        for key, box in (("alt", tb_alt), ("speed", tb_spd), ("gimbal", tb_gim)):
+            try:
+                init_params[key] = float(box.text)
+            except ValueError:
+                print(f"[GUI] ignoring invalid {key} value: {box.text!r}")
+        # The polygon may have been replaced with "Open KML..."
+        init_params["poly"] = poly_ref["poly"]
+        init_params["lon_c"] = poly_ref["lon_c"]
+        init_params["lat_c"] = poly_ref["lat_c"]
+        init_params["applied"] = True
         plt.close(fig)
 
     def on_open(event):
@@ -839,352 +849,211 @@ def show_preview_gui(poly, center_lon, center_lat, init_params):
     plt.show()
     return init_params
 
-def standalone_cli_fallback():
-    def _ask_opt_int(prompt):
-        try:
-            s = input(f"{prompt} (empty=skip): ").strip()
-            return int(s) if s != "" else None
-        except Exception:
-            return None
-    print("[STANDALONE] Tk < 8.6 detected. Switching to CLI fallback (text prompts).")
-    # Prompt for essential paths
-    try:
-        kml_path = input("Enter path to Polygon KML (e.g., ./2025sj.kml): ").strip()
-    except EOFError:
-        kml_path = ""
-    if not kml_path:
-        print("[STANDALONE] No KML path provided. Exit.")
-        return
-    try:
-        out_dir = input("Enter output directory (default ./output): ").strip()
-    except EOFError:
-        out_dir = ""
-    if not out_dir:
-        out_dir = "./output"
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Optional param prompts with defaults
-    def _ask_float(prompt, default):
-        try:
-            s = input(f"{prompt} [{default}]: ").strip()
-            return float(s) if s else float(default)
-        except Exception:
-            return float(default)
-    def _ask_int(prompt, default):
-        try:
-            s = input(f"{prompt} [{default}]: ").strip()
-            return int(s) if s else int(default)
-        except Exception:
-            return int(default)
-    def _ask_bool01(prompt, default):
-        try:
-            s = input(f"{prompt} (1/0) [{default}]: ").strip()
-            return 1 if (s=="1" or (not s and default==1)) else 0
-        except Exception:
-            return default
-
-    circle_radius = _ask_float("Circle radius (m)", 30.0)
-    per_ring = _ask_int("Points per circle", 60)
-    circle_overlap = _ask_float("Circle overlap (0~0.9)", 0.3)
-    center_step = _ask_float("Center step (m, 0=auto)", 0.0)
-    cover_padding = _ask_float("Padding (m)", 10.0)
-    grid_bearing = _ask_float("Grid bearing (deg)", 0.0)
-    clip_inside = _ask_bool01("Clip inside polygon", 1)
-    alt = _ask_float("Altitude (m)", 50.0)
-    speed = _ask_float("Speed (m/s)", 6.0)
-    gimbal = _ask_float("Gimbal pitch (deg)", -45.0)
-    max_points = _ask_int("Max points per sub-mission", 300)
-
-    drone_enum = _ask_opt_int("Drone enum")
-    drone_sub = _ask_opt_int("Drone sub-enum")
-    payload_enum = _ask_opt_int("Payload enum")
-    payload_sub = _ask_opt_int("Payload sub-enum")
-    payload_pos = _ask_opt_int("Payload position index")
-    device = {
-        "drone_enum": drone_enum,
-        "drone_sub": drone_sub,
-        "payload_enum": payload_enum,
-        "payload_sub": payload_sub,
-        "payload_pos": payload_pos,
-    }
-
-    # Parse & generate
-    poly = parse_polygon_kml(kml_path)
-    lon_c, lat_c = polygon_centroid(poly)
-    step_m = center_step if center_step > 0 else max(2.0 * circle_radius * (1.0 - circle_overlap), 1.0)
-    centers = grid_circle_centers(poly, lon_c, lat_c, step_m=step_m, padding_m=cover_padding, bearing_deg=grid_bearing)
+# ------------------ Output ------------------
+def build_waypoints(poly, lon_c, lat_c, cfg):
+    """Circle centres and waypoint list for one configuration dict."""
+    per_ring = max(3, int(cfg["per_ring"]))
+    step_m = cfg["center_step"] if cfg["center_step"] > 0 else \
+        max(2.0 * cfg["circle_radius"] * (1.0 - cfg["circle_overlap"]), 1.0)
+    centers = grid_circle_centers(poly, lon_c, lat_c, step_m=step_m,
+                                  padding_m=cfg["cover_padding"], bearing_deg=cfg["grid_bearing"])
+    if (not cfg["clip_inside"]) and cfg.get("prune_outside", 1):
+        centers = prune_centers_outside(poly, centers, cfg["circle_radius"], per_ring,
+                                        cfg.get("start_bearing", 0.0))
     pts = generate_cover_cco_points(
-        centers,
-        per_circle=per_ring,
-        circle_radius_m=circle_radius,
-        start_bearing_deg=0.0,
-        clip_poly=poly if clip_inside else None
-    )
+        centers, per_circle=per_ring, circle_radius_m=cfg["circle_radius"],
+        start_bearing_deg=cfg.get("start_bearing", 0.0),
+        clip_poly=poly if cfg["clip_inside"] else None)
+    return centers, pts
 
-    # Write outputs
+
+def write_outputs(out_dir, poly, lon_c, lat_c, centers, pts, cfg,
+                  pack_full_kmz=True, pack_parts_kmz=True):
+    """Write full mission, optional KMZ, optional split parts and preview.png."""
+    if not pts:
+        print("[WARN] No waypoints generated: check radius, padding and the clip setting.")
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    device = {k: cfg.get(k) for k in ("drone_enum", "drone_sub", "payload_enum", "payload_sub", "payload_pos")}
+    alt, speed, gimbal, suffix = cfg["alt"], cfg["speed"], cfg["gimbal"], cfg["file_suffix"]
+
     tpl = os.path.join(out_dir, "template.kml")
     wpl = os.path.join(out_dir, "waylines.wpml")
-    write_template_kml(tpl, pts, alt, speed, gimbal, device=device)
-    write_waylines_wpml(wpl, pts, alt, speed, gimbal, file_suffix="LiangchaoDeng_SHZU", device=device)
-    write_kmz(os.path.join(out_dir, "cco_full.kmz"), tpl, wpl)
+    write_template_kml(tpl, pts, alt, speed, gimbal, file_suffix=suffix, device=device)
+    write_waylines_wpml(wpl, pts, alt, speed, gimbal, file_suffix=suffix, device=device)
+    if pack_full_kmz:
+        write_kmz(os.path.join(out_dir, "cco_full.kmz"), tpl, wpl)
 
-    # Split if needed
-    total = len(pts)
+    total, max_points = len(pts), int(cfg.get("max_points") or 0)
     if max_points and max_points < total:
         cuts = chunk_slices(total, max_points)
         parts_dir = os.path.join(out_dir, "parts")
         os.makedirs(parts_dir, exist_ok=True)
         for pi, (s, e) in enumerate(cuts, start=1):
-            part_pts = pts[s:e]
-            t_path, w_path = write_slice_files(parts_dir, "template", pi, part_pts, alt, speed, gimbal, "LiangchaoDeng_SHZU", device=device)
-            build_kmz_for_part(parts_dir, f"part{pi:02d}", t_path, w_path)
-        print(f"[SPLIT] total {total} waypoints; split by {max_points} -> {len(cuts)} parts; output: {parts_dir}")
+            t_path, w_path = write_slice_files(parts_dir, "template", pi, pts[s:e],
+                                               alt, speed, gimbal, suffix, device=device)
+            if pack_parts_kmz:
+                build_kmz_for_part(parts_dir, f"part{pi:02d}", t_path, w_path)
+        print(f"[SPLIT] {total} waypoints, max {max_points} per part -> {len(cuts)} parts in {parts_dir}")
     else:
-        print(f"[INFO] total waypoints {total} ≤ max_points={max_points}; no split needed.")
+        print(f"[INFO] {total} waypoints (limit {max_points}); no split needed.")
 
-    # Save static preview PNG (no GUI required)
     try:
-        out_png = os.path.join(out_dir, "preview.png")
-        save_preview_png(poly, pts, centers, lon_c, lat_c, out_png)
-    except Exception as e:
+        save_preview_png(poly, pts, centers, lon_c, lat_c, os.path.join(out_dir, "preview.png"))
+    except Exception as e:  # preview is optional
         print(f"[PREVIEW] failed to save PNG: {e}")
-
     print(f"[DONE] Output directory: {out_dir}")
 
-# ------------------ Standalone（无参数直接运行） ------------------
+
+DEFAULTS = {
+    "circle_radius": 30.0, "per_ring": 60, "circle_overlap": 0.3, "center_step": 0.0,
+    "cover_padding": 10.0, "grid_bearing": 0.0, "start_bearing": 0.0,
+    "clip_inside": 1, "prune_outside": 1, "max_points": 300,
+    "alt": 50.0, "speed": 6.0, "gimbal": -45.0, "file_suffix": "LiangchaoDeng_SHZU",
+    # Matrice 4T defaults; set to None to omit the device tags
+    "drone_enum": 99, "drone_sub": 1, "payload_enum": 89, "payload_sub": 0, "payload_pos": 0,
+}
+
+
+def run_gui(poly, lon_c, lat_c, cfg):
+    """Open the slider GUI; return (cfg, poly, lon_c, lat_c) or None if closed without Apply."""
+    cfg = show_preview_gui(poly, lon_c, lat_c, cfg)
+    if not cfg.pop("applied", False):
+        return None
+    poly = cfg.pop("poly", poly)
+    lon_c = cfg.pop("lon_c", lon_c)
+    lat_c = cfg.pop("lat_c", lat_c)
+    return cfg, poly, lon_c, lat_c
+
+
+def standalone_cli_fallback():
+    """Text prompts when no GUI backend is available."""
+    def ask(prompt, default, cast):
+        try:
+            s = input(f"{prompt} [{default}]: ").strip()
+        except EOFError:
+            s = ""
+        if not s:
+            return default
+        try:
+            return cast(s)
+        except ValueError:
+            print(f"  invalid value, using {default}")
+            return default
+
+    print("[STANDALONE] No GUI backend (Tk >= 8.6 or Qt). Using text prompts.")
+    kml_path = ask("Path to polygon KML", "", str)
+    if not kml_path:
+        print("[STANDALONE] No KML path given. Exit.")
+        return
+    out_dir = ask("Output directory", "./output", str)
+
+    cfg = dict(DEFAULTS)
+    for key, prompt, cast in (
+            ("circle_radius", "Circle radius (m)", float), ("per_ring", "Points per circle", int),
+            ("circle_overlap", "Circle overlap (0-0.9)", float), ("center_step", "Centre step (m, 0 = auto)", float),
+            ("cover_padding", "Padding (m)", float), ("grid_bearing", "Grid bearing (deg)", float),
+            ("clip_inside", "Clip to polygon (1/0)", int), ("alt", "Altitude (m)", float),
+            ("speed", "Speed (m/s)", float), ("gimbal", "Gimbal pitch (deg)", float),
+            ("max_points", "Max waypoints per part", int)):
+        cfg[key] = ask(prompt, cfg[key], cast)
+    for key in ("drone_enum", "drone_sub", "payload_enum", "payload_sub", "payload_pos"):
+        cfg[key] = ask(f"{key} (empty = default)", cfg[key], int)
+
+    poly = parse_polygon_kml(kml_path)
+    lon_c, lat_c = polygon_centroid(poly)
+    centers, pts = build_waypoints(poly, lon_c, lat_c, cfg)
+    write_outputs(out_dir, poly, lon_c, lat_c, centers, pts, cfg)
+
+
 def standalone_flow():
-    """
-    Run without CLI args:
-    - Pick polygon KML
-    - (Optional) pick output folder
-    - Open interactive preview GUI
-    - On Apply & Generate: write outputs
-    """
-    # If neither Tk(>=8.6) nor Qt is available, fallback to CLI
+    """No arguments: pick KML and output folder, tune in the GUI, then write."""
     if (not TK_OK) and (not USE_QT):
         return standalone_cli_fallback()
 
-    # file pickers (Tk or Qt)
     kml_path = pick_open_file_kml()
     if not kml_path:
         print("[STANDALONE] No KML selected. Exit.")
         return
-    out_dir = pick_select_folder()
-    if not out_dir:
-        out_dir = os.path.join(os.path.dirname(kml_path), "output")
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = pick_select_folder() or os.path.join(os.path.dirname(kml_path), "output")
 
-    # parse polygon & center
     poly = parse_polygon_kml(kml_path)
     lon_c, lat_c = polygon_centroid(poly)
+    res = run_gui(poly, lon_c, lat_c, dict(DEFAULTS))
+    if res is None:
+        print("[STANDALONE] Window closed without Apply. Nothing written.")
+        return
+    cfg, poly, lon_c, lat_c = res
+    centers, pts = build_waypoints(poly, lon_c, lat_c, cfg)
+    write_outputs(out_dir, poly, lon_c, lat_c, centers, pts, cfg)
 
-    # default params for first preview
-    params = {
-        "circle_radius": 30.0,
-        "per_ring": 60,
-        "circle_overlap": 0.3,
-        "center_step": 0.0,      # 0 => auto from radius & overlap
-        "cover_padding": 10.0,
-        "grid_bearing": 0.0,
-        "clip_inside": 1,
-        "prune_outside": 1,
-        "max_points": 300,
-        # Defaults for Matrice 4T + payload
-        "drone_enum": 99,
-        "drone_sub": 1,
-        "payload_enum": 89,
-        "payload_sub": 0,
-        "payload_pos": 0,
-    }
-    params = show_preview_gui(poly, lon_c, lat_c, params)
-
-    # compute point sequence with chosen params
-    step_m = params["center_step"] if params["center_step"] > 0 else max(2.0 * params["circle_radius"] * (1.0 - params["circle_overlap"]), 1.0)
-    centers = grid_circle_centers(poly, lon_c, lat_c, step_m=step_m, padding_m=params["cover_padding"], bearing_deg=params["grid_bearing"])
-    # Prune centers if needed
-    if (not params.get("clip_inside", 1)) and params.get("prune_outside", 1):
-        centers = prune_centers_outside(poly, centers, params["circle_radius"], params["per_ring"], 0.0)
-    globals()["__preview_centers"] = centers
-    pts = generate_cover_cco_points(
-        centers,
-        per_circle=params["per_ring"],
-        circle_radius_m=params["circle_radius"],
-        start_bearing_deg=0.0,
-        clip_poly=poly if params["clip_inside"] else None
-    )
-
-    # write outputs (use sensible defaults)
-    alt = 50.0; speed = 6.0; gimbal = -45.0; file_suffix = "LiangchaoDeng_SHZU"
-    tpl = os.path.join(out_dir, "template.kml")
-    wpl = os.path.join(out_dir, "waylines.wpml")
-    device = {
-        "drone_enum": params.get("drone_enum"),
-        "drone_sub": params.get("drone_sub"),
-        "payload_enum": params.get("payload_enum"),
-        "payload_sub": params.get("payload_sub"),
-        "payload_pos": params.get("payload_pos"),
-    }
-    write_template_kml(tpl, pts, alt, speed, gimbal, device=device)
-    write_waylines_wpml(wpl, pts, alt, speed, gimbal, file_suffix=file_suffix, device=device)
-    write_kmz(os.path.join(out_dir, "cco_full.kmz"), tpl, wpl)
-
-    # split if needed (default 300)
-    # split if needed (GUI-chosen max points)
-    max_points = int(params.get("max_points", 300))
-    total = len(pts)
-    if max_points and max_points < total:
-        cuts = chunk_slices(total, max_points)
-        parts_dir = os.path.join(out_dir, "parts")
-        os.makedirs(parts_dir, exist_ok=True)
-        for pi, (s, e) in enumerate(cuts, start=1):
-            part_pts = pts[s:e]
-            t_path, w_path = write_slice_files(parts_dir, "template", pi, part_pts, alt, speed, gimbal, file_suffix, device=device)
-            build_kmz_for_part(parts_dir, f"part{pi:02d}", t_path, w_path)
-        print(f"[SPLIT] total {total} waypoints; split by {max_points} -> {len(cuts)} parts; output: {parts_dir}")
-    else:
-        print(f"[INFO] total waypoints {total} ≤ max_points={max_points}; no split needed.")
-
-    print(f"[DONE] Output directory: {out_dir}")
 
 # ------------------ CLI ------------------
 def main():
-    # 无参数：进入 Standalone GUI
     if len(sys.argv) == 1:
         standalone_flow()
         return
 
+    d = DEFAULTS
     ap = argparse.ArgumentParser(description="Generate cover-style CCO routes from a KML Polygon (template.kml + waylines.wpml + KMZ)")
     ap.add_argument("--polygon", required=True, help="KML file containing a Polygon")
-    ap.add_argument("--center_mode", choices=["centroid","bbox_center"], default="centroid", help="Center point: centroid or bounding-box center")
-    ap.add_argument("--per_ring", type=int, default=60, help="Points per circle (cover mode)")
-    ap.add_argument("--start_bearing", type=float, default=0.0, help="Start bearing in degrees (0=N, clockwise)")
-    ap.add_argument("--alt", type=float, default=50.0, help="Altitude (m)")
-    ap.add_argument("--speed", type=float, default=6.0, help="Speed (m/s)")
-    ap.add_argument("--gimbal", type=float, default=-45.0, help="Gimbal pitch (deg, negative=down)")
-    ap.add_argument("--file_suffix", default="LiangchaoDeng_SHZU", help="Photo filename suffix")
-    # Output/split/pack/preview
-    ap.add_argument("--kmz", type=int, default=1, help="Whether to generate KMZ (1=yes)")
+    ap.add_argument("--center_mode", choices=["centroid", "bbox_center"], default="centroid", help="Grid origin: polygon centroid or bounding-box centre")
+    ap.add_argument("--per_ring", type=int, default=d["per_ring"], help="Waypoints per circle")
+    ap.add_argument("--start_bearing", type=float, default=0.0, help="Bearing of the first waypoint on a circle (0 = N, clockwise)")
+    ap.add_argument("--alt", type=float, default=d["alt"], help="Altitude relative to take-off (m)")
+    ap.add_argument("--speed", type=float, default=d["speed"], help="Speed (m/s)")
+    ap.add_argument("--gimbal", type=float, default=d["gimbal"], help="Gimbal pitch (deg, negative = down)")
+    ap.add_argument("--file_suffix", default=d["file_suffix"], help="Suffix added to photo file names")
+    # Output / split / pack / preview
+    ap.add_argument("--kmz", type=int, default=1, help="Write KMZ files at all (1 = yes)")
     ap.add_argument("--out_dir", default="output", help="Output directory (default ./output)")
-    ap.add_argument("--max_points", type=int, default=300, help="Max waypoints per sub-mission (default 300)")
-    ap.add_argument("--pack_full_kmz", type=int, default=1, help="Pack full KMZ (1=yes)")
-    ap.add_argument("--pack_parts_kmz", type=int, default=1, help="Pack split KMZ parts (1=yes)")
-    ap.add_argument("--preview", type=int, default=0, help="Show static preview window (1=yes)")
-    # Cover mode params
-    ap.add_argument("--circle_radius", type=float, default=30.0, help="Circle radius (m) for cover mode")
-    ap.add_argument("--center_step", type=float, default=0.0, help="Center spacing (m); 0 = auto from radius & overlap")
-    ap.add_argument("--circle_overlap", type=float, default=0.3, help="Linear overlap between adjacent circles (0~0.9)")
-    ap.add_argument("--cover_padding", type=float, default=10.0, help="Padding (m) to expand bbox to avoid edge gaps")
-    # New params
-    ap.add_argument("--preview_gui", type=int, default=0, help="Open interactive preview with sliders (1=yes)")
-    ap.add_argument("--grid_bearing", type=float, default=0.0, help="Grid rotation angle in degrees (clockwise)")
-    ap.add_argument("--clip_inside", type=int, default=1, help="Keep only waypoints inside polygon (1=yes, 0=no)")
-    ap.add_argument("--prune_outside", type=int, default=1, help="When clip=0, drop circles with no waypoint inside polygon (1=yes)")
-    ap.add_argument("--drone_enum", type=int, default=None, help="DJI droneEnumValue (integer)")
-    ap.add_argument("--drone_sub", type=int, default=None, help="DJI droneSubEnumValue (integer)")
-    ap.add_argument("--payload_enum", type=int, default=None, help="DJI payloadEnumValue (integer)")
-    ap.add_argument("--payload_sub", type=int, default=None, help="DJI payloadSubEnumValue (integer)")
-    ap.add_argument("--payload_pos", type=int, default=None, help="DJI payloadPositionIndex (integer)")
+    ap.add_argument("--max_points", type=int, default=d["max_points"], help="Max waypoints per sub-mission (0 = never split)")
+    ap.add_argument("--pack_full_kmz", type=int, default=1, help="Pack cco_full.kmz (1 = yes)")
+    ap.add_argument("--pack_parts_kmz", type=int, default=1, help="Pack partXX.kmz for each sub-mission (1 = yes)")
+    ap.add_argument("--preview", type=int, default=0, help="Show a static preview window (1 = yes)")
+    # Cover layout
+    ap.add_argument("--circle_radius", type=float, default=d["circle_radius"], help="Circle radius (m)")
+    ap.add_argument("--center_step", type=float, default=d["center_step"], help="Centre spacing (m); 0 = 2*r*(1-overlap)")
+    ap.add_argument("--circle_overlap", type=float, default=d["circle_overlap"], help="Linear overlap between neighbouring circles (0-0.9)")
+    ap.add_argument("--cover_padding", type=float, default=d["cover_padding"], help="Grow the bounding box by this many metres")
+    ap.add_argument("--preview_gui", type=int, default=0, help="Tune in the slider GUI before writing (1 = yes)")
+    ap.add_argument("--grid_bearing", type=float, default=d["grid_bearing"], help="Grid rotation (deg, clockwise)")
+    ap.add_argument("--clip_inside", type=int, default=d["clip_inside"], help="Keep only waypoints inside the polygon (1/0)")
+    ap.add_argument("--prune_outside", type=int, default=d["prune_outside"], help="With clip 0: drop circles that never enter the polygon (1/0)")
+    # Device tags (omitted from the files when not given)
+    ap.add_argument("--drone_enum", type=int, default=None, help="DJI droneEnumValue, e.g. 99 for Matrice 4T")
+    ap.add_argument("--drone_sub", type=int, default=None, help="DJI droneSubEnumValue")
+    ap.add_argument("--payload_enum", type=int, default=None, help="DJI payloadEnumValue")
+    ap.add_argument("--payload_sub", type=int, default=None, help="DJI payloadSubEnumValue")
+    ap.add_argument("--payload_pos", type=int, default=None, help="DJI payloadPositionIndex")
     args = ap.parse_args()
 
-    # 读取多边形并求中心
     poly = parse_polygon_kml(args.polygon)
     if args.center_mode == "bbox_center":
         lons = [p[0] for p in poly]; lats = [p[1] for p in poly]
-        lon_c = (min(lons)+max(lons))/2.0; lat_c = (min(lats)+max(lats))/2.0
+        lon_c = (min(lons) + max(lons)) / 2.0; lat_c = (min(lats) + max(lats)) / 2.0
     else:
         lon_c, lat_c = polygon_centroid(poly)
 
-    # 交互式预览（可选）：允许先调参后生成
+    cfg = {k: getattr(args, k) for k in DEFAULTS}
+
     if args.preview_gui:
-        params = {
-            "circle_radius": args.circle_radius,
-            "per_ring": args.per_ring,
-            "circle_overlap": args.circle_overlap,
-            "center_step": args.center_step,
-            "cover_padding": args.cover_padding,
-            "grid_bearing": args.grid_bearing,
-            "clip_inside": args.clip_inside,
-            "max_points": args.max_points,
-            "drone_enum": args.drone_enum,
-            "drone_sub": args.drone_sub,
-            "payload_enum": args.payload_enum,
-            "payload_sub": args.payload_sub,
-            "payload_pos": args.payload_pos,
-        }
-        params = show_preview_gui(poly, lon_c, lat_c, params)
-        # 覆盖 CLI 值
-        args.circle_radius = params["circle_radius"]
-        args.per_ring = params["per_ring"]
-        args.circle_overlap = params["circle_overlap"]
-        args.center_step = params["center_step"]
-        args.cover_padding = params["cover_padding"]
-        args.grid_bearing = params["grid_bearing"]
-        args.clip_inside = params["clip_inside"]
-        args.max_points = params.get("max_points", args.max_points)
-        args.per_ring = max(3, int(args.per_ring))
-        args.drone_enum = params.get("drone_enum")
-        args.drone_sub = params.get("drone_sub")
-        args.payload_enum = params.get("payload_enum")
-        args.payload_sub = params.get("payload_sub")
-        args.payload_pos = params.get("payload_pos")
+        res = run_gui(poly, lon_c, lat_c, cfg)
+        if res is None:
+            print("[GUI] Window closed without Apply. Nothing written.")
+            return
+        cfg, poly, lon_c, lat_c = res
 
-    # enforce per_ring minimum
-    args.per_ring = max(3, int(args.per_ring))
+    centers, pts = build_waypoints(poly, lon_c, lat_c, cfg)
 
-    # 生成点序列（覆盖式）
-    step_m = args.center_step if args.center_step > 0 else max(2.0 * args.circle_radius * (1.0 - args.circle_overlap), 1.0)
-    centers = grid_circle_centers(poly, lon_c, lat_c, step_m=step_m, padding_m=args.cover_padding, bearing_deg=args.grid_bearing)
-    # Prune centers if needed
-    if (not args.clip_inside) and args.prune_outside:
-        centers = prune_centers_outside(poly, centers, args.circle_radius, args.per_ring, args.start_bearing)
-    globals()["__preview_centers"] = centers  # 给预览画圆心
-    pts = generate_cover_cco_points(
-        centers,
-        per_circle=args.per_ring,
-        circle_radius_m=args.circle_radius,
-        start_bearing_deg=args.start_bearing,
-        clip_poly=poly if args.clip_inside else None
-    )
-
-    # 预览
     if args.preview:
-        show_preview(poly, pts, lon_c, lat_c, title=f"CCO Preview (cover, rotate {args.grid_bearing:.1f}°, Clip={'ON' if args.clip_inside else 'OFF'})")
+        show_preview(poly, pts, lon_c, lat_c, centers=centers,
+                     title=f"CCO preview (grid {cfg['grid_bearing']:.1f} deg, clip {'on' if cfg['clip_inside'] else 'off'})")
 
-    # 输出目录
-    out_root = os.path.abspath(args.out_dir)
-    os.makedirs(out_root, exist_ok=True)
+    write_outputs(os.path.abspath(args.out_dir), poly, lon_c, lat_c, centers, pts, cfg,
+                  pack_full_kmz=bool(args.kmz and args.pack_full_kmz),
+                  pack_parts_kmz=bool(args.kmz and args.pack_parts_kmz))
 
-    # 写全量文件
-    device = {
-        "drone_enum": args.drone_enum,
-        "drone_sub": args.drone_sub,
-        "payload_enum": args.payload_enum,
-        "payload_sub": args.payload_sub,
-        "payload_pos": args.payload_pos,
-    }
-    tpl = os.path.join(out_root, "template.kml")
-    wpl = os.path.join(out_root, "waylines.wpml")
-    write_template_kml(tpl, pts, args.alt, args.speed, args.gimbal, device=device)
-    write_waylines_wpml(wpl, pts, args.alt, args.speed, args.gimbal, file_suffix=args.file_suffix, device=device)
-
-    # 打完整 KMZ（可选）
-    if args.kmz and args.pack_full_kmz:
-        write_kmz(os.path.join(out_root, "cco_full.kmz"), tpl, wpl)
-
-    # 分片与打包
-    total = len(pts)
-    if args.max_points and args.max_points < total:
-        cuts = chunk_slices(total, args.max_points)
-        parts_dir = os.path.join(out_root, "parts")
-        os.makedirs(parts_dir, exist_ok=True)
-        for pi, (s, e) in enumerate(cuts, start=1):
-            part_pts = pts[s:e]
-            t_path, w_path = write_slice_files(parts_dir, "template", pi, part_pts, args.alt, args.speed, args.gimbal, args.file_suffix, device=device)
-            if args.pack_parts_kmz:
-                build_kmz_for_part(parts_dir, f"part{pi:02d}", t_path, w_path)
-        print(f"[SPLIT] total {total} waypoints; split by {args.max_points} -> {len(cuts)} parts; output: {parts_dir}")
-    else:
-        print(f"[INFO] total waypoints {total} ≤ max_points={args.max_points}; no split needed.")
 
 if __name__ == "__main__":
     main()

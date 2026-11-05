@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "CCO Flight Planner: cover-style circular UAV waylines from a field polygon"
+type: software
+authors:
+  - family-names: Deng
+    given-names: Liangchao
+repository-code: "https://github.com/smiler488/cco-flight-planner"
+license: MIT
+date-released: "2025-08-17"
+keywords:
+  - UAV
+  - flight planning
+  - oblique photogrammetry
+  - DJI WPML
+  - plant phenotyping

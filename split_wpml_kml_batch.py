@@ -1,22 +1,32 @@
-# split_wpml_kml_batch.py
-# 用法示例：
-#   python split_wpml_kml_batch.py ^
-#     --max 300 ^
-#     --out_dir .\splits ^
-#     --inputs .\main_route.kml .\companion_route.kml
+"""
+Split existing DJI WPML missions into sub-missions of at most N waypoints.
+
+Use this for routes that already exist (made in DJI Pilot 2, DJI Terra or by
+create_wpml_kml_batch.py). All input files are cut at the same waypoint
+indices, so a template.kml and its waylines.wpml stay paired, and each part
+is packed as partXX.kmz ready for import.
+
+Example:
+    python split_wpml_kml_batch.py --max 300 --out_dir splits \
+        --inputs output/template.kml output/waylines.wpml
+
+Without --inputs, template.kml and waylines.wpml in the current folder are used.
+
+Author: Liangchao Deng (邓良超)
+License: MIT
+"""
 
 import os
 import argparse
 import xml.etree.ElementTree as ET
 from copy import deepcopy
-import shutil
 import zipfile
 
 NS = {
     "kml": "http://www.opengis.net/kml/2.2",
     "wpml": "http://www.dji.com/wpmz/1.0.4",
 }
-# 注册命名空间，写回时保持前缀
+# keep the original prefixes when writing back
 for prefix, uri in NS.items():
     ET.register_namespace(prefix if prefix != "kml" else "", uri)
 
@@ -34,7 +44,7 @@ def get_doc_folder_placemarks(root):
     folder = fone(doc, "kml:Folder")
     placemarks = fall(folder, "kml:Placemark")
     if not placemarks:
-        raise ValueError("未找到任何 Placemark。")
+        raise ValueError("No Placemark found in the first Folder.")
     return doc, folder, placemarks
 
 def clone_folder_without_placemarks(folder):
@@ -46,13 +56,12 @@ def clone_folder_without_placemarks(folder):
     return nf
 
 def reindex_one_placemark(pm, new_idx):
-    # <wpml:index>
     idx = pm.find("wpml:index", NS)
     if idx is None:
         idx = ET.SubElement(pm, f"{{{NS['wpml']}}}index")
     idx.text = str(new_idx)
 
-    # actionGroup（常见为到点拍照一组动作）
+    # actionGroup ids follow the waypoint index (one take-photo group per waypoint)
     ag = pm.find("wpml:actionGroup", NS)
     if ag is not None:
         agid = ag.find("wpml:actionGroupId", NS)
@@ -72,14 +81,15 @@ def reindex_one_placemark(pm, new_idx):
     return pm
 
 def build_doc_slice(orig_doc, folder_template, placemark_slice, part_id, renumber=True):
+    """New Document with every non-Folder child of the original (missionConfig,
+    droneInfo, payloadInfo, author, ...) and one Folder holding the slice."""
     new_doc = ET.Element(orig_doc.tag, orig_doc.attrib)
-
-    mc = orig_doc.find("wpml:missionConfig", NS)
-    if mc is not None:
-        new_doc.append(deepcopy(mc))
+    for child in orig_doc:
+        if child.tag != folder_template.tag:
+            new_doc.append(deepcopy(child))
 
     nf = clone_folder_without_placemarks(folder_template)
-    # 可选：把 templateId 写成分片号，便于区分
+    # templateId = part number, so the parts can be told apart on the controller
     tid = nf.find("wpml:templateId", NS)
     if tid is None:
         tid = ET.SubElement(nf, f"{{{NS['wpml']}}}templateId")
@@ -105,7 +115,6 @@ def process_one_file(in_path, cuts, out_dir, part_no_from_zero=True):
     tree = ET.parse(in_path)
     root = tree.getroot()
     doc, folder, pms = get_doc_folder_placemarks(root)
-    total = len(pms)
 
     base = os.path.splitext(os.path.basename(in_path))[0]
     for pi, (s, e) in enumerate(cuts):
@@ -115,114 +124,76 @@ def process_one_file(in_path, cuts, out_dir, part_no_from_zero=True):
         ext = os.path.splitext(in_path)[1] or ".kml"
         out_file = os.path.join(out_dir, f"{base}_part{pi+1:02d}{ext}")
         ET.ElementTree(new_root).write(out_file, encoding="utf-8", xml_declaration=True)
-        print(f"[{base}] -> {out_file} (航点 {s}-{e-1}, 共 {e-s} 个)")
+        print(f"[{base}] -> {out_file} (waypoints {s}-{e-1}, {e-s} in total)")
 
 def guess_role_for_input(path):
-    """根据文件名/扩展名推断角色：'template' 或 'waylines'。"""
+    """'waylines' for *.wpml or names containing 'waylines', otherwise 'template'."""
     name = os.path.basename(path).lower()
     ext = os.path.splitext(name)[1].lower()
     if "waylines" in name or ext == ".wpml":
         return "waylines"
-    # 默认把 .kml 当 template
     return "template"
 
 def build_kmz_for_part(out_dir, inputs_info, part_index):
+    """Pack part ``part_index`` (1-based) as partXX.kmz with the WPMZ layout
+    wpmz/template.kml, wpmz/waylines.wpml and an empty wpmz/res/.
+
+    inputs_info: [{'base': ..., 'ext': ..., 'role': 'template' | 'waylines'}]
     """
-    将某一分片的文件打包为 KMZ：
-    结构：
-      partXX.kmz
-        └─ wpmz/
-           ├─ template.kml
-           ├─ waylines.wpml
-           └─ res/   (空目录)
-    inputs_info: [{'base':..., 'ext':..., 'role': 'template'|'waylines'}]
-    part_index: 从 1 开始
-    """
-    # 准备临时构建目录
     part_tag = f"part{part_index:02d}"
-    build_root = os.path.join(out_dir, f"{part_tag}_build")
-    wpmz_dir = os.path.join(build_root, "wpmz")
-    res_dir = os.path.join(wpmz_dir, "res")
-    os.makedirs(res_dir, exist_ok=True)
-
-    # 复制并重命名为标准文件名
-    got_template = False
-    got_waylines = False
-    for info in inputs_info:
-        src = os.path.join(out_dir, f"{info['base']}_part{part_index:02d}{info['ext']}")
-        if not os.path.exists(src):
-            raise FileNotFoundError(f"未找到分片文件：{src}")
-        if info["role"] == "waylines":
-            dst = os.path.join(wpmz_dir, "waylines.wpml")
-            shutil.copyfile(src, dst)
-            got_waylines = True
-        else:
-            # 默认视为 template
-            dst = os.path.join(wpmz_dir, "template.kml")
-            shutil.copyfile(src, dst)
-            got_template = True
-
-    # 生成 kmz（zip）
     kmz_path = os.path.join(out_dir, f"{part_tag}.kmz")
     with zipfile.ZipFile(kmz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # 写入目录占位（可选）
         zf.writestr("wpmz/", "")
         zf.writestr("wpmz/res/", "")
-        # 写入文件
-        if got_template:
-            zf.write(os.path.join(wpmz_dir, "template.kml"), arcname="wpmz/template.kml")
-        if got_waylines:
-            zf.write(os.path.join(wpmz_dir, "waylines.wpml"), arcname="wpmz/waylines.wpml")
-
-    # 清理临时目录
-    shutil.rmtree(build_root, ignore_errors=True)
-    print(f"[KMZ] -> {kmz_path}  (已包含 wpmz/template.kml, wpmz/waylines.wpml, 空 res/)")
+        for info in inputs_info:
+            src = os.path.join(out_dir, f"{info['base']}_part{part_index:02d}{info['ext']}")
+            if not os.path.exists(src):
+                raise FileNotFoundError(f"Missing part file: {src}")
+            name = "waylines.wpml" if info["role"] == "waylines" else "template.kml"
+            zf.write(src, arcname=f"wpmz/{name}")
+    print(f"[KMZ] -> {kmz_path}")
 
 def main():
-    ap = argparse.ArgumentParser(description="按首个 KML 的航点切片方案，对多个 WPML KML 同步分割")
-    ap.add_argument("--inputs", nargs="*", required=False, help="多个输入 KML，首个为切片基准；若省略则自动寻找同目录 template.kml 与 waylines.wpml")
-    ap.add_argument("--max", type=int, default=300, help="单文件最大航点数，默认 300")
-    ap.add_argument("--out_dir", default="splits", help="输出目录，默认 ./splits")
+    ap = argparse.ArgumentParser(description="Split paired WPML files (template.kml / waylines.wpml) at the same waypoint indices.")
+    ap.add_argument("--inputs", nargs="*", help="input files; the first one defines the cut points "
+                                                "(default: template.kml and waylines.wpml in the current folder)")
+    ap.add_argument("--max", type=int, default=300, help="max waypoints per part (default 300)")
+    ap.add_argument("--out_dir", default="splits", help="output folder (default ./splits)")
+    ap.add_argument("--no_kmz", action="store_true", help="only write the split files, no partXX.kmz")
     args = ap.parse_args()
+    if args.max < 1:
+        ap.error("--max must be at least 1")
 
-    # 若未提供 --inputs，则自动使用脚本同目录下的 template.kml 和 waylines.wpml
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     if not args.inputs:
-        auto_template = os.path.join(script_dir, "template.kml")
-        auto_waylines = os.path.join(script_dir, "waylines.wpml")
-        if not os.path.exists(auto_template):
-            raise FileNotFoundError(f"未提供 --inputs，且未找到默认文件：{auto_template}")
-        if not os.path.exists(auto_waylines):
-            raise FileNotFoundError(f"未提供 --inputs，且未找到默认文件：{auto_waylines}")
-        args.inputs = [auto_template, auto_waylines]
-        print(f"未提供 --inputs，自动使用: {args.inputs}")
-
-    # 输出目录若为相对路径，则放到脚本同目录下
-    if not os.path.isabs(args.out_dir):
-        args.out_dir = os.path.join(script_dir, args.out_dir)
+        args.inputs = ["template.kml", "waylines.wpml"]
+        for f in args.inputs:
+            if not os.path.exists(f):
+                ap.error(f"no --inputs given and {f} not found in the current folder")
+        print(f"Using {args.inputs}")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # 以第一个 KML 为基准计算切片
+    # The first file defines the cut points
     base_tree = ET.parse(args.inputs[0])
     base_root = base_tree.getroot()
     _, _, base_pms = get_doc_folder_placemarks(base_root)
     total = len(base_pms)
     cuts = split_points(total, args.max)
-    print(f"基准文件共有 {total} 个航点，将切成 {len(cuts)} 份。切片区间：{cuts}")
+    print(f"{total} waypoints -> {len(cuts)} parts: {cuts}")
 
-    # 逐个文件同步分割（校验航点数一致）
+    # Every file must have the same number of waypoints
     for p in args.inputs:
         t = ET.parse(p)
         r = t.getroot()
         _, _, pms = get_doc_folder_placemarks(r)
         if len(pms) != total:
-            raise ValueError(f"文件 {p} 的航点数 {len(pms)} 与基准 {total} 不一致，无法联动切分。")
+            raise ValueError(f"{p} has {len(pms)} waypoints but {args.inputs[0]} has {total}; cannot split them together.")
         process_one_file(p, cuts, args.out_dir)
 
-    # ------------------------------------------------------------
-    # 组装 KMZ：将每个分片的配对文件打包为 partXX.kmz
-    # ------------------------------------------------------------
+    if args.no_kmz:
+        return
+
+    # Pack the paired files of each part as partXX.kmz
     inputs_info = []
     for p in args.inputs:
         base = os.path.splitext(os.path.basename(p))[0]

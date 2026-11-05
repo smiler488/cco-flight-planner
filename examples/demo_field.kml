@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>demo_field</name>
+    <Placemark>
+      <name>Demo plot, about 120 m x 80 m</name>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              86.0500,44.3000,0 86.0515,44.3000,0 86.0515,44.3007,0 86.0500,44.3007,0 86.0500,44.3000,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Document>
+</kml>
