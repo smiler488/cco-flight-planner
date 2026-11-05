@@ -1,216 +1,122 @@
 # CCO Flight Planner
 
-Generate **DJI CCO (Circular-Coverage Orbit)** waylines from a KML **Polygon** — with an interactive preview GUI, automatic splitting for large missions, and optional KMZ packaging.
+English | [中文](README.zh-CN.md)
 
-> Script: `create_wpml_kml_batch.py`
+[![CI](https://github.com/smiler488/cco-flight-planner/actions/workflows/test.yml/badge.svg)](https://github.com/smiler488/cco-flight-planner/actions/workflows/test.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![Python 3.8+](https://img.shields.io/badge/Python_3.8%2B-informational)
+Generates cross-circular oblique (CCO) flight routes for DJI drones from a field boundary. A grid of equal circles is laid over a KML polygon, each circle gets waypoints with the camera facing its centre, and the result is written as DJI WPML (`template.kml` + `waylines.wpml`) and packed as KMZ for DJI Pilot 2. Long missions are split into parts that fit the controller limit.
 
-![status](https://img.shields.io/badge/status-stable-blue) ![python](https://img.shields.io/badge/Python-3.8%2B-informational) ![license](https://img.shields.io/badge/License-Choose--one-lightgrey)
+I use these routes to photograph field trials for 3-D reconstruction. Circular oblique views of every point give much better canopy side-walls in the point cloud than the usual nadir lawn-mower pattern, which is what plant height and canopy volume estimates depend on. This script tiles a whole field with such circles in one go.
 
----
+![preview of the demo field](examples/demo_preview.png)
 
-##  Features
+## Installation
 
-- **Cover-style CCO route generation**: grid of equal-radius circular passes that cover a polygon region
-- **Interactive GUI** (TkAgg / QtAgg + matplotlib): live slider tuning, keyboard fine control, open-new-KML, _Apply & Generate_
-- **Autospacing**: center spacing auto-derives from radius & overlap (or set explicitly)
-- **Pruning**: when not clipping to polygon, drop circles that don’t touch the polygon interior
-- **Outputs**: `template.kml`, `waylines.wpml`, and optional packaged `cco_full.kmz`
-- **Slicing**: split into parts when waypoints exceed a chosen threshold; optionally pack each part into `partXX.kmz`
-- **Device tags**: embeds DJI `droneInfo` / `payloadInfo` into KML/WPML (e.g., Matrice 4T + H20T gimbal indices)
-- **Static preview PNG** (no GUI needed in CLI fallback)
+Python 3.8 or newer.
 
----
-
-##  Requirements
-
-- Python **3.8+**
-- Packages:
-  - `matplotlib` (for preview/GUI; static PNG also uses it)
-  - (Optional GUI backends) **Tk ≥ 8.6** or **PyQt5 / PySide6**
-
-Install:
 ```bash
-pip install matplotlib
-# If you prefer Qt:
-pip install PyQt5    # or: pip install PySide6
+git clone https://github.com/smiler488/cco-flight-planner.git
+cd cco-flight-planner
+pip install -r requirements.txt
 ```
 
-> The script gracefully falls back to a **text-based CLI** when GUI backends are unavailable.
+The interactive window needs Tk 8.6 or newer (`python -m tkinter` should open a window) or PyQt5 / PySide6. Without either, the script falls back to text prompts and still saves a static `preview.png`.
 
----
+## Usage
 
-##  Quick Start
+### Interactive
 
-### A) One‑click Standalone (GUI)
-Double‑click `create_wpml_kml_batch.py` or run without arguments:
 ```bash
 python create_wpml_kml_batch.py
 ```
-Flow:
-1. Select a **Polygon KML**.
-2. Choose an **output folder**.
-3. Adjust sliders / device fields → **Apply & Generate**.
-4. Outputs are written to the chosen folder (and a static `preview.png` is saved).
 
-### B) Command Line (Batch)
+Pick the field KML and an output folder. Adjust radius, waypoints per circle, overlap, grid rotation, altitude, speed and gimbal pitch in the window, then press **Apply & Generate**. **Open KML…** switches to another field without restarting. Closing the window without Apply writes nothing.
+
+Keyboard: `Tab`/`↓` and `Shift+Tab`/`↑` select a slider, `←`/`→` nudge it, with `Shift` for ten times the step.
+
+### Command line
+
 ```bash
-python create_wpml_kml_batch.py \
-  --polygon ./demo.kml \
-  --drone_enum 99 --drone_sub 1 \
-  --payload_enum 89 --payload_sub 0 --payload_pos 0 \
-  --circle_radius 30 --circle_overlap 0.3 --per_ring 60 \
-  --alt 50 --gimbal -45 --speed 6 \
-  --out_dir ./output --max_points 300 \
-  --grid_bearing 0 --clip_inside 1 \
-  --preview_gui 0
+python create_wpml_kml_batch.py --polygon examples/demo_field.kml \
+  --circle_radius 20 --circle_overlap 0.3 --per_ring 24 \
+  --alt 30 --gimbal -45 --speed 6 \
+  --drone_enum 99 --drone_sub 1 --payload_enum 89 --payload_sub 0 --payload_pos 0 \
+  --max_points 300 --out_dir output
 ```
 
-Windows (PowerShell) example:
-```powershell
-python .\create_wpml_kml_batch.py `
-  --polygon .\demo.kml `
-  --drone_enum 99 --drone_sub 1 `
-  --payload_enum 89 --payload_sub 0 --payload_pos 0 `
-  --circle_radius 30 --circle_overlap 0.3 --per_ring 60 `
-  --alt 50 --gimbal -45 --speed 6 `
-  --out_dir .\output --max_points 300 `
-  --grid_bearing 0 --clip_inside 1 `
-  --preview_gui 0
-```
+Add `--preview_gui 1` to check and adjust the layout in the window before writing.
 
----
-
-##  Inputs & Outputs
-
-**Input**
-- A KML file containing a single **`<Polygon>`** (outer boundary).
-
-**Outputs (in `--out_dir`)**
-- `template.kml` – KML template with waypoints + embedded device/mission config
-- `waylines.wpml` – DJI waylines file
-- `cco_full.kmz` – (optional) packaged WPMZ structure with both files
-- `parts/` – (optional) split `template_partXX.kml` + `template_partXX.wpml` and packaged `partXX.kmz`
-- `preview.png` – static plot of polygon, centers, and path (saved in GUI & CLI fallback)
-
----
-
-##  CLI Options
-
-| Option | Type / Default | Description |
+| Option | Default | Meaning |
 |---|---|---|
-| `--polygon` | **required** | Path to KML containing a `Polygon`. |
-| `--center_mode` | `centroid` \| `bbox_center` (default: `centroid`) | Choose center reference for grid build. |
-| `--per_ring` | int (default **60**, min 3) | Points per circle. |
-| `--start_bearing` | float (deg, default **0.0**) | Start angle (0 = North, clockwise positive). |
-| `--alt` | float m (default **50.0**) | Waypoint altitude. |
-| `--speed` | float m/s (default **6.0**) | Mission transitional speed. |
-| `--gimbal` | float deg (default **-45.0**) | Gimbal pitch (negative = down). |
-| `--file_suffix` | str (default **LiangchaoDeng_SHZU**) | Appended to photo filenames via action group. |
-| `--kmz` | int 0/1 (default **1**) | Whether to package a full KMZ. |
-| `--out_dir` | str (default **output**) | Output directory. |
-| `--max_points` | int (default **300**) | Split threshold for sub-missions. |
-| `--pack_full_kmz` | int 0/1 (default **1**) | Pack `cco_full.kmz`. |
-| `--pack_parts_kmz` | int 0/1 (default **1**) | Pack `partXX.kmz` in `parts/`. |
-| `--preview` | int 0/1 (default **0**) | Show a non-interactive preview window. |
-| **Cover mode** |||
-| `--circle_radius` | float m (default **30.0**) | Circle radius. |
-| `--center_step` | float m (default **0.0**) | Center spacing; `0` = auto from radius & overlap. |
-| `--circle_overlap` | 0~0.9 (default **0.3**) | Linear overlap between adjacent circles. |
-| `--cover_padding` | float m (default **10.0**) | Expand polygon bbox to reduce edge gaps. |
-| `--grid_bearing` | float deg (default **0.0**) | Grid rotation (clockwise). |
-| `--clip_inside` | int 0/1 (default **1**) | Keep only waypoints inside polygon. |
-| `--prune_outside` | int 0/1 (default **1**) | When `clip_inside=0`, drop centers with no interior points. |
-| **GUI** |||
-| `--preview_gui` | int 0/1 (default **0**) | Launch interactive GUI before generation. |
-| **Device tags** |||
-| `--drone_enum` | int / optional | DJI `droneEnumValue`. Example **99** (Matrice 4T). |
-| `--drone_sub` | int / optional | DJI `droneSubEnumValue`. Example **1**. |
-| `--payload_enum` | int / optional | DJI `payloadEnumValue`. Example **89**. |
-| `--payload_sub` | int / optional | DJI `payloadSubEnumValue`. Example **0**. |
-| `--payload_pos` | int / optional | DJI `payloadPositionIndex`. Example **0**. |
+| `--polygon` | required | KML with one `Polygon` (first one is used) |
+| `--circle_radius` | 30 | circle radius, m |
+| `--per_ring` | 60 | waypoints per circle |
+| `--circle_overlap` | 0.3 | overlap between neighbouring circles; centre spacing = `2r(1 - overlap)` |
+| `--center_step` | 0 | fixed centre spacing in m (0 = derived from radius and overlap) |
+| `--cover_padding` | 10 | grow the field bounding box by this many metres before laying the grid |
+| `--grid_bearing` | 0 | grid rotation, degrees clockwise; align it with the rows |
+| `--start_bearing` | 0 | bearing of the first waypoint on each circle |
+| `--clip_inside` | 1 | keep only waypoints inside the field |
+| `--prune_outside` | 1 | with `--clip_inside 0`, drop circles that never enter the field |
+| `--alt` / `--speed` / `--gimbal` | 50 / 6 / -45 | height above take-off (m), speed (m/s), gimbal pitch (deg) |
+| `--file_suffix` | `LiangchaoDeng_SHZU` | added to every photo file name |
+| `--max_points` | 300 | waypoints per sub-mission (0 = no split) |
+| `--kmz`, `--pack_full_kmz`, `--pack_parts_kmz` | 1 | write KMZ files |
+| `--center_mode` | `centroid` | grid origin: `centroid` or `bbox_center` |
+| `--drone_enum` … `--payload_pos` | none | DJI device tags; left out of the files when not set |
 
-> **Tip**: If `--center_step` is `0`, effective spacing is `2 * radius * (1 - overlap)` (clamped to ≥ 1 m).
+The GUI starts with Matrice 4T tags (`99/1`, payload `89/0/0`). On the command line no device tags are written unless you pass them.
 
----
+### Splitting an existing route
 
-##  GUI Controls & Shortcuts
+`split_wpml_kml_batch.py` cuts routes made elsewhere (DJI Pilot 2, DJI Terra, or this tool) into parts. `template.kml` and `waylines.wpml` are cut at the same indices and each part is packed as `partXX.kmz`:
 
-- **Sliders** (right panel): `Radius`, `Pts/circ`, `Overlap`, `Center step`, `Padding`, `Bearing`, `Max points`
-- **TextBoxes**: `DroneEnum`, `DroneSub`, `PayloadEnum`, `PayloadSub`, `PayloadPos`
-- **Buttons**: `Clip ON/OFF`, `Prune ON/OFF`, `Open KML…`, `Apply & Generate`
-- **Keyboard**:
-  - `Tab` / `Down` — select next slider; `Shift+Tab` / `Up` — previous
-  - `Left` / `Right` — fine-step active slider; **hold Shift** for ×10 step
-
----
-
-##  How It Works (Quick Notes)
-
-- Builds a **grid of circle centers** over an expanded polygon bounding box (with optional rotation), then **snake-orders rows**.
-- For each center, sample `per_ring` points on the circle. If **Clip = ON**, keep only points inside polygon.
-- **Start angles** on each circle are **realigned** to minimize jumps between neighboring circles; ring direction alternates.
-- When **clip = OFF** and **prune = ON**, circles with no interior samples are dropped to save time/space.
-
----
-
-##  Troubleshooting
-
-- **No GUI pops up**
-  - Ensure **Tk ≥ 8.6** (`python -m tkinter`) or install **PyQt5 / PySide6**.
-  - Headless servers: use CLI; static `preview.png` still works.
-- **KMZ won’t import**
-  - DJI apps sometimes expect specific WPMZ structure: this tool writes `wpmz/template.kml` and `wpmz/waylines.wpml` at the archive root.
-- **Waypoints exceed device limits**
-  - Use a smaller `per_ring` or larger `center_step` / `radius`, or lower `--max_points` to enable slicing.
-- **Device fields**
-  - If you don’t know exact enums, leave them empty; files still generate without embedded device tags.
-
----
-
-##  Project Layout
-
-```
-create_wpml_kml_batch.py   # main script
-README.md                  # this file
+```bash
+python split_wpml_kml_batch.py --max 300 --out_dir splits \
+  --inputs output/template.kml output/waylines.wpml
 ```
 
-You may later add:
-```
-examples/
-  demo.kml
-  screenshots/preview.png
-```
-
----
-
-##  Contributing
-
-Issues and PRs are welcome. Please include a minimal KML polygon to reproduce any problem reports.
-
----
-
-##  License
-
-Choose an OSI-approved license (e.g., MIT, Apache-2.0). Add it as `LICENSE` in the repo root and update the badge at the top.
-
----
-
-##  Citation (optional)
-
-If this tool helps your research, consider citing it:
+## Output
 
 ```
-@software{cco_flight_planner,
-  title   = {CCO Flight Planner: Generate DJI CCO waylines from KML Polygons},
-  author  = {Your Name},
-  year    = {2025},
-  url     = {https://github.com/<yourname>/cco-flight-planner}
+output/
+├── template.kml      full mission
+├── waylines.wpml
+├── cco_full.kmz      wpmz/template.kml + wpmz/waylines.wpml + wpmz/res/
+├── preview.png       field outline, circle centres and flight path
+└── parts/            only when the mission exceeds --max_points
+    ├── template_part01.kml / .wpml
+    └── part01.kmz …
+```
+
+## Practical notes
+
+- Heights are relative to the take-off point (`relativeToStartPoint`). Take off from a spot level with the field.
+- Waypoints use "stop at point" turns and a take-photo action at each point. 24–36 waypoints per circle has been a good balance between overlap and flight time for me.
+- With clipping on, circles near the boundary become arcs and the path jumps between arc ends. That is expected. Turn clipping off with pruning on if you want full circles at the edges.
+- Import one KMZ into DJI Pilot 2 and check the route on the map before flying a whole series.
+
+## Changes in this revision
+
+- Fields opened with **Open KML…** in the window were ignored when writing. The route now uses the field shown on screen.
+- The splitter dropped `droneInfo` / `payloadInfo` from each part. All document-level tags are now kept.
+- The splitter wrote to the script folder instead of the current folder. Fixed.
+- Altitude, speed and gimbal pitch can be set in the window (they were fixed at 50 m, 6 m/s, -45°).
+- The take-photo action used payload position 0 regardless of `--payload_pos`, and `template.kml` ignored `--file_suffix`. Both fixed.
+- KML files without the KML namespace are now accepted.
+- The three copies of the generation code were merged into one; temporary build folders were removed from KMZ packing.
+- Added `examples/demo_field.kml`, `requirements.txt`, `CITATION.cff` and the Chinese README.
+
+## Citation
+
+```bibtex
+@software{deng_cco_flight_planner,
+  author = {Deng, Liangchao},
+  title  = {CCO Flight Planner: cover-style circular UAV waylines from a field polygon},
+  year   = {2025},
+  url    = {https://github.com/smiler488/cco-flight-planner}
 }
 ```
 
----
+## License
 
-## ✍ Acknowledgments
-
-- Built for field missions that require **dense circular coverage** over irregular plots.
-- Defaults tuned for **Matrice 4T** class hardware (`drone_enum=99`, `drone_sub=1`, `payload_enum=89`, `payload_sub=0`, `payload_pos=0`). Adapt as needed.
+MIT, see [LICENSE](LICENSE). Liangchao Deng (邓良超).
