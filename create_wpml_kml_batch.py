@@ -193,8 +193,9 @@ def bearing_to_vector(bearing_deg, dist_m):
     return dx, dy
 
 def normalize_heading(deg):
+    """Heading in [0, 360). Rounding can turn -1e-14 % 360 into 360.0, so wrap that to 0."""
     x = deg % 360.0
-    return x if x >= 0 else x+360
+    return 0.0 if x >= 360.0 - 1e-9 else x
 
 # Rotation and point-in-polygon test
 def rotate_xy(x, y, deg):
