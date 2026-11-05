@@ -2,6 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
+[![CI](https://github.com/smiler488/cco-flight-planner/actions/workflows/test.yml/badge.svg)](https://github.com/smiler488/cco-flight-planner/actions/workflows/test.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![Python 3.8+](https://img.shields.io/badge/Python_3.8%2B-informational)
 Generates cross-circular oblique (CCO) flight routes for DJI drones from a field boundary. A grid of equal circles is laid over a KML polygon, each circle gets waypoints with the camera facing its centre, and the result is written as DJI WPML (`template.kml` + `waylines.wpml`) and packed as KMZ for DJI Pilot 2. Long missions are split into parts that fit the controller limit.
 
 I use these routes to photograph field trials for 3-D reconstruction. Circular oblique views of every point give much better canopy side-walls in the point cloud than the usual nadir lawn-mower pattern, which is what plant height and canopy volume estimates depend on. This script tiles a whole field with such circles in one go.

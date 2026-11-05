@@ -2,6 +2,7 @@
 
 [English](README.md) | 中文
 
+[![CI](https://github.com/smiler488/cco-flight-planner/actions/workflows/test.yml/badge.svg)](https://github.com/smiler488/cco-flight-planner/actions/workflows/test.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) ![Python 3.8+](https://img.shields.io/badge/Python_3.8%2B-informational)
 根据地块边界生成大疆无人机的交叉环绕倾斜（CCO）航线。程序在 KML 多边形上铺一组等半径的圆，每个圆上布设航点，镜头朝向圆心，输出大疆 WPML 文件（`template.kml` + `waylines.wpml`），并打包成 DJI Pilot 2 可以导入的 KMZ。航点过多的任务会自动拆成几段，保证每段不超过遥控器的航点上限。
 
 我用这种航线拍田间试验来做三维重建。和常规的正射"割草机"航线相比，每个位置都有环绕的倾斜视角，重建出的冠层侧面完整得多，而株高和冠层体积的估算靠的就是这些侧面。这个脚本可以一次性用圆形航线铺满整块地。
